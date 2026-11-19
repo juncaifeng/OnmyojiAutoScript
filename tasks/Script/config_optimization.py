@@ -16,7 +16,12 @@ class ScheduleRule(str, Enum):
     FIFO = 'FIFO'  # 先来后到，（按照任务的先后顺序进行调度）
     PRIORITY = 'Priority'  # 基于优先级，同一个优先级的任务按照先来后到的顺序进行调度，优先级高的任务先调度
 
+class ScheduleMode(str, Enum):
+    TIME = 'time'  # 按 scheduler.next_run 的定时调度
+    LOOP = 'loop'  # 任务完成 -> 探针 -> 目标任务 -> 回到 start_task 的循环调度
+
 class Optimization(BaseModel):
+    schedule_mode: ScheduleMode = Field(default=ScheduleMode.TIME, description='schedule_mode_help')
     screenshot_interval: float = Field(default=0.3,
                                        description='screenshot_interval_help')
     combat_screenshot_interval: float = Field(default=1.0,

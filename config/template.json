@@ -40,7 +40,22 @@
       "when_task_queue_empty": "goto_main",
       "schedule_rule": "Filter",
       "queue_mode": false,
-      "queue_idle_threshold": 10
+      "queue_idle_threshold": 10,
+      "schedule_mode": "time"
+    },
+    "loop": {
+      "enable": false,
+      "start_task": "Exploration",
+      "probe": "realm_raid_ticket",
+      "operator": ">",
+      "threshold": 0,
+      "target_task": "RealmRaid",
+      "else_task": "",
+      "interval": 300,
+      "max_polls": 0,
+      "rest_every": 0,
+      "rest_duration": 1800,
+      "timeout_minutes": 360
     }
   },
   "restart": {

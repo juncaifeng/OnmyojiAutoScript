@@ -31,6 +31,7 @@ from threading import Thread
 from multiprocessing.queues import Queue
 
 
+from module.base.loop import compare_value, wait_after_poll
 from module.config.utils import convert_to_underscore
 from module.runtime import data_path
 from module.config.config import Config
@@ -529,6 +530,143 @@ class Script:
             self.config.task_call('SoulsTidy')
             time.sleep(1)
 
+    # ------------------------------------------------------------------ loop scheduler
+    def _loop_sleep(self, seconds: int) -> None:
+        """Sleep in small steps so mode changes and config reloads are noticed."""
+        deadline = time.time() + max(0, seconds)
+        while time.time() < deadline:
+            time.sleep(min(5, max(0, deadline - time.time())))
+            mode = getattr(self.config.script.optimization.schedule_mode, 'value',
+                           self.config.script.optimization.schedule_mode)
+            if mode != 'loop':
+                return
+            if self.config.should_reload():
+                del_cached_property(self, 'config')
+
+    def _loop_run_task(self, task: str) -> bool:
+        task = (task or '').strip()
+        if not task:
+            return False
+        command = inflection.camelize(convert_to_underscore(task))
+        module_path = Path.cwd() / 'tasks' / command / 'script_task.py'
+        if not module_path.is_file():
+            logger.error(f'Loop task `{task}` not found: {module_path}')
+            return False
+
+        if self._emulator_down:
+            self.device = Device(self.config)
+            self._emulator_down = False
+        else:
+            _ = self.device
+
+        self.device.stuck_record_clear()
+        self.device.click_record_clear()
+        logger.hr(command, level=0)
+        logger.info(f'Loop scheduler: start task `{command}`')
+        self.config.model.running_task = command
+        try:
+            restart_before = self.config.model.restart.scheduler.next_run
+        except Exception:
+            restart_before = None
+        started = datetime.now()
+        success = self.run(command)
+        self.config.model.running_task = ''
+        self.anti_ban_guard.record_active((datetime.now() - started).total_seconds())
+
+        # In time mode task_call('Restart') is picked up by next_run. Loop mode
+        # has no next_run, so run it immediately when a task requested it.
+        if command != 'Restart':
+            try:
+                restart_after = self.config.model.restart.scheduler.next_run
+                if restart_before != restart_after and restart_after <= datetime.now() + timedelta(seconds=1):
+                    logger.warning('Loop scheduler: task requested Restart, running it now')
+                    self.run('Restart')
+                    del_cached_property(self, 'config')
+            except Exception:
+                pass
+        return success
+
+    def _loop_probe(self, loop) -> int | None:
+        probe = getattr(loop.probe, 'value', loop.probe)
+        if probe == 'always':
+            return 1
+
+        state_path = data_path('log', f'loop_probe_{self.config_name}.json')
+        try:
+            if state_path.is_file():
+                state_path.unlink()
+            if not self._loop_run_task('LoopProbe'):
+                return None
+            data = json.loads(state_path.read_text(encoding='utf-8'))
+            if not data.get('ok'):
+                logger.warning(f"Loop probe failed: {data.get('error', 'unknown error')}")
+                return None
+            return int(data.get('value', 0))
+        except Exception as error:
+            logger.warning(f'Loop probe error: {error}')
+            return None
+
+    def _loop_wait_for_condition(self, loop) -> bool:
+        deadline = time.time() + loop.timeout_minutes * 60 if loop.timeout_minutes > 0 else None
+        polls = 0
+        while True:
+            mode = getattr(self.config.script.optimization.schedule_mode, 'value',
+                           self.config.script.optimization.schedule_mode)
+            if mode != 'loop':
+                logger.info('Loop scheduler: mode changed, stop waiting')
+                return False
+
+            value = self._loop_probe(loop)
+            probe = getattr(loop.probe, 'value', loop.probe)
+            condition = probe == 'always' or (
+                value is not None and compare_value(value, loop.operator, loop.threshold)
+            )
+            logger.info(
+                f'Loop probe {probe}: value={value}, condition={condition}, polls={polls}'
+            )
+            if condition:
+                return True
+
+            polls += 1
+            if loop.max_polls > 0 and polls >= loop.max_polls:
+                logger.warning(f'Loop scheduler: reached max polls {loop.max_polls}')
+                return False
+            if deadline is not None and time.time() >= deadline:
+                logger.warning('Loop scheduler: polling timeout')
+                return False
+
+            sleep_for = wait_after_poll(
+                polls, loop.interval, loop.rest_every, loop.rest_duration
+            )
+            logger.info(f'Loop scheduler: sleep {sleep_for}s (failed polls={polls})')
+            self._loop_sleep(sleep_for)
+
+    def loop_cycle(self) -> None:
+        """One A -> probe -> B iteration of the loop scheduler."""
+        loop = self.config.script.loop
+        if not loop.enable:
+            logger.error('Loop mode is selected but script.loop.enable is false, waiting 30s')
+            time.sleep(30)
+            return
+
+        logger.hr('Loop scheduler', level=0)
+        logger.info(
+            f'Loop cycle: start={loop.start_task}, probe={getattr(loop.probe, "value", loop.probe)}, '
+            f'target={loop.target_task}, else={loop.else_task or "-"}'
+        )
+        if not self._loop_run_task(loop.start_task):
+            logger.warning('Loop start task failed, retrying after interval')
+            self._loop_sleep(loop.interval)
+            return
+
+        if self._loop_wait_for_condition(loop):
+            self._loop_run_task(loop.target_task)
+        elif loop.else_task:
+            self._loop_run_task(loop.else_task)
+        else:
+            # No fallback task; avoid a tight A -> A loop.
+            self._loop_sleep(loop.interval)
+
     def run(self, command: str) -> bool:
         """
         :param command:  大写驼峰命名的任务名字
@@ -646,6 +784,14 @@ class Script:
                 with _log_switch_lock:
                     logger.set_file_logger(self.config_name, do_cleanup=True)
                 start_day = date.today()
+
+            # 循环调度与定时调度二选一：循环模式完全忽略 next_run。
+            if getattr(self.config.script.optimization.schedule_mode, 'value',
+                       self.config.script.optimization.schedule_mode) == 'loop':
+                self.loop_cycle()
+                del_cached_property(self, 'config')
+                continue
+
             # Check update event from GUI
             # if self.stop_event is not None:
             #     if self.stop_event.is_set():
